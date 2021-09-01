@@ -9,7 +9,7 @@ pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
-usingnamespace @import("query.zig");
+pub usingnamespace @import("query.zig");
 usingnamespace @import("error.zig");
 
 const logger = std.log.scoped(.sqlite);

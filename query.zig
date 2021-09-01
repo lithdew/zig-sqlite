@@ -22,6 +22,8 @@ pub const ParsedQuery = struct {
     query_size: usize,
 
     pub fn from(comptime query: []const u8) Self {
+        @setEvalBranchQuota(10_000);
+
         comptime var buf: [query.len]u8 = undefined;
         comptime var pos = 0;
         comptime var state = .Start;
