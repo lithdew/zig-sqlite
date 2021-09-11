@@ -9,8 +9,12 @@ pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
-pub usingnamespace @import("query.zig");
-usingnamespace @import("error.zig");
+pub const ParsedQuery = @import("query.zig").ParsedQuery;
+
+const Text = @import("query.zig").Text;
+
+const errors = @import("errors.zig");
+const Error = errors.Error;
 
 const logger = std.log.scoped(.sqlite);
 
@@ -72,11 +76,11 @@ pub const Blob = struct {
     pub fn close(self: *Self) !void {
         const result = c.sqlite3_blob_close(self.handle);
         if (result != c.SQLITE_OK) {
-            return errorFromResultCode(result);
+            return errors.errorFromResultCode(result);
         }
     }
 
-    pub const Reader = io.Reader(*Self, Error, read);
+    pub const Reader = io.Reader(*Self, errors.Error, read);
 
     /// reader returns a io.Reader.
     pub fn reader(self: *Self) Reader {
@@ -100,7 +104,7 @@ pub const Blob = struct {
             self.offset,
         );
         if (result != c.SQLITE_OK) {
-            return errorFromResultCode(result);
+            return errors.errorFromResultCode(result);
         }
 
         self.offset += @intCast(c_int, tmp_buffer.len);
@@ -123,7 +127,7 @@ pub const Blob = struct {
             self.offset,
         );
         if (result != c.SQLITE_OK) {
-            return errorFromResultCode(result);
+            return errors.errorFromResultCode(result);
         }
 
         self.offset += @intCast(c_int, data.len);
@@ -284,12 +288,10 @@ fn getLastDetailedErrorFromDb(db: *c.sqlite3) DetailedError {
 /// A Db can be opened with a file database or a in-memory database:
 ///
 ///     // File database
-///     var db: sqlite.Db = undefined;
-///     try db.init(.{ .mode = { .File = "/tmp/data.db" } });
+///     var db = try sqlite.Db.init(.{ .mode = .{ .File = "/tmp/data.db" } });
 ///
 ///     // In memory database
-///     var db: sqlite.Db = undefined;
-///     try db.init(.{ .mode = { .Memory = {} } });
+///     var db = try sqlite.Db.init(.{ .mode = .{ .Memory = {} } });
 ///
 pub const Db = struct {
     const Self = @This();
@@ -354,7 +356,7 @@ pub const Db = struct {
                     } else {
                         diags.err = getDetailedErrorFromResultCode(result);
                     }
-                    return errorFromResultCode(result);
+                    return errors.errorFromResultCode(result);
                 }
 
                 return Self{ .db = db.? };
@@ -372,7 +374,7 @@ pub const Db = struct {
                     } else {
                         diags.err = getDetailedErrorFromResultCode(result);
                     }
-                    return errorFromResultCode(result);
+                    return errors.errorFromResultCode(result);
                 }
 
                 return Self{ .db = db.? };
@@ -409,7 +411,7 @@ pub const Db = struct {
     ///
     ///     const journal_mode = try db.pragma([]const u8, allocator, .{}, "journal_mode", null);
     ///
-    pub fn pragmaAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: anytype, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
+    pub fn pragmaAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
         comptime var buf: [1024]u8 = undefined;
         comptime var query = getPragmaQuery(&buf, name, arg);
 
@@ -432,7 +434,7 @@ pub const Db = struct {
     /// The pragma name must be known at comptime.
     ///
     /// This cannot allocate memory. If your pragma command returns text you must use an array or call `pragmaAlloc`.
-    pub fn pragma(self: *Self, comptime Type: type, options: anytype, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
+    pub fn pragma(self: *Self, comptime Type: type, options: QueryOptions, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
         comptime var buf: [1024]u8 = undefined;
         comptime var query = getPragmaQuery(&buf, name, arg);
 
@@ -581,7 +583,7 @@ pub fn Iterator(comptime Type: type) type {
             }
             if (result != c.SQLITE_ROW) {
                 diags.err = getLastDetailedErrorFromDb(self.db);
-                return errorFromResultCode(result);
+                return errors.errorFromResultCode(result);
             }
 
             const columns = c.sqlite3_column_count(self.stmt);
@@ -606,11 +608,25 @@ pub fn Iterator(comptime Type: type) type {
                     debug.assert(columns == 1);
                     return try self.readArray(Type, 0);
                 },
+                .Enum => |TI| {
+                    debug.assert(columns == 1);
+
+                    if (comptime std.meta.trait.isZigString(Type.BaseType)) {
+                        @compileError("cannot read into type " ++ @typeName(Type) ++ " ; BaseType " ++ @typeName(Type.BaseType) ++ " requires allocation, use nextAlloc or oneAlloc");
+                    }
+
+                    if (@typeInfo(Type.BaseType) == .Int) {
+                        const innervalue = try self.readField(Type.BaseType, options, 0);
+                        return @intToEnum(Type, @intCast(TI.tag_type, innervalue));
+                    }
+
+                    @compileError("enum column " ++ @typeName(Type) ++ " must have a BaseType of either string or int");
+                },
                 .Struct => {
                     std.debug.assert(columns == TypeInfo.Struct.fields.len);
                     return try self.readStruct(options);
                 },
-                else => @compileError("cannot read into type " ++ @typeName(Type) ++ " ; if dynamic memory allocation is required use nextAlloc"),
+                else => @compileError("cannot read into type " ++ @typeName(Type) ++ " ; if dynamic memory allocation is required use nextAlloc or oneAlloc"),
             }
         }
 
@@ -625,7 +641,7 @@ pub fn Iterator(comptime Type: type) type {
             }
             if (result != c.SQLITE_ROW) {
                 diags.err = getLastDetailedErrorFromDb(self.db);
-                return errorFromResultCode(result);
+                return errors.errorFromResultCode(result);
             }
 
             const columns = c.sqlite3_column_count(self.stmt);
@@ -668,7 +684,24 @@ pub fn Iterator(comptime Type: type) type {
                 },
                 .Pointer => {
                     debug.assert(columns == 1);
-                    return try self.readPointer(Type, allocator, 0);
+                    return try self.readPointer(Type, .{
+                        .allocator = allocator,
+                    }, 0);
+                },
+                .Enum => |TI| {
+                    debug.assert(columns == 1);
+
+                    const innervalue = try self.readField(Type.BaseType, .{
+                        .allocator = allocator,
+                    }, 0);
+
+                    if (comptime std.meta.trait.isZigString(Type.BaseType)) {
+                        return std.meta.stringToEnum(Type, innervalue) orelse unreachable;
+                    }
+                    if (@typeInfo(Type.BaseType) == .Int) {
+                        return @intToEnum(Type, @intCast(TI.tag_type, innervalue));
+                    }
+                    @compileError("enum column " ++ @typeName(Type) ++ " must have a BaseType of either string or int");
                 },
                 .Struct => {
                     std.debug.assert(columns == TypeInfo.Struct.fields.len);
@@ -710,10 +743,10 @@ pub fn Iterator(comptime Type: type) type {
                                 ret[size] = s;
                             }
                         },
-                        else => @compileError("cannot populate field " ++ field.name ++ " of type array of " ++ @typeName(arr.child)),
+                        else => @compileError("cannot read into array of " ++ @typeName(arr.child)),
                     }
                 },
-                else => @compileError("cannot populate field " ++ field.name ++ " of type array of " ++ @typeName(arr.child)),
+                else => @compileError("cannot read into type " ++ @typeName(ret)),
             }
             return ret;
         }
@@ -749,8 +782,7 @@ pub fn Iterator(comptime Type: type) type {
 
         // dupeWithSentinel is like dupe/dupeZ but allows for any sentinel value.
         fn dupeWithSentinel(comptime SliceType: type, allocator: *mem.Allocator, data: []const u8) !SliceType {
-            const type_info = @typeInfo(SliceType);
-            switch (type_info) {
+            switch (@typeInfo(SliceType)) {
                 .Pointer => |ptr_info| {
                     if (ptr_info.sentinel) |sentinel| {
                         const slice = try allocator.alloc(u8, data.len + 1);
@@ -817,21 +849,26 @@ pub fn Iterator(comptime Type: type) type {
             }
         }
 
-        fn readPointer(self: *Self, comptime PointerType: type, allocator: *mem.Allocator, i: usize) !PointerType {
-            const type_info = @typeInfo(PointerType);
+        fn readPointer(self: *Self, comptime PointerType: type, options: anytype, i: usize) !PointerType {
+            if (!comptime std.meta.trait.is(.Struct)(@TypeOf(options))) {
+                @compileError("options passed to readPointer must be a struct");
+            }
+            if (!comptime std.meta.trait.hasField("allocator")(@TypeOf(options))) {
+                @compileError("options passed to readPointer must have an allocator field");
+            }
 
             var ret: PointerType = undefined;
-            switch (type_info) {
+            switch (@typeInfo(PointerType)) {
                 .Pointer => |ptr| {
                     switch (ptr.size) {
                         .One => {
-                            ret = try allocator.create(ptr.child);
-                            errdefer allocator.destroy(ret);
+                            ret = try options.allocator.create(ptr.child);
+                            errdefer options.allocator.destroy(ret);
 
-                            ret.* = try self.readField(ptr.child, i, .{ .allocator = allocator });
+                            ret.* = try self.readField(ptr.child, options, i);
                         },
                         .Slice => switch (ptr.child) {
-                            u8 => ret = try self.readBytes(PointerType, allocator, i, .Text),
+                            u8 => ret = try self.readBytes(PointerType, options.allocator, i, .Text),
                             else => @compileError("cannot read pointer of type " ++ @typeName(PointerType)),
                         },
                         else => @compileError("cannot read pointer of type " ++ @typeName(PointerType)),
@@ -844,20 +881,21 @@ pub fn Iterator(comptime Type: type) type {
         }
 
         fn readOptional(self: *Self, comptime OptionalType: type, options: anytype, _i: usize) !OptionalType {
-            const i = @intCast(c_int, _i);
-            const type_info = @typeInfo(OptionalType);
+            if (!comptime std.meta.trait.is(.Struct)(@TypeOf(options))) {
+                @compileError("options passed to readOptional must be a struct");
+            }
 
             var ret: OptionalType = undefined;
-            switch (type_info) {
+            switch (@typeInfo(OptionalType)) {
                 .Optional => |opt| {
                     // Easy way to know if the column represents a null value.
-                    const value = c.sqlite3_column_value(self.stmt, i);
+                    const value = c.sqlite3_column_value(self.stmt, @intCast(c_int, _i));
                     const datatype = c.sqlite3_value_type(value);
 
                     if (datatype == c.SQLITE_NULL) {
                         return null;
                     } else {
-                        const val = try self.readField(opt.child, _i, options);
+                        const val = try self.readField(opt.child, options, _i);
                         ret = val;
                         return ret;
                     }
@@ -888,12 +926,16 @@ pub fn Iterator(comptime Type: type) type {
         //
         // TODO(vincent): add comptime checks for the fields/columns.
         fn readStruct(self: *Self, options: anytype) !Type {
+            if (!comptime std.meta.trait.is(.Struct)(@TypeOf(options))) {
+                @compileError("options passed to readStruct must be a struct");
+            }
+
             var value: Type = undefined;
 
             inline for (@typeInfo(Type).Struct.fields) |field, _i| {
                 const i = @as(usize, _i);
 
-                const ret = try self.readField(field.field_type, i, options);
+                const ret = try self.readField(field.field_type, options, i);
 
                 @field(value, field.name) = ret;
             }
@@ -901,22 +943,36 @@ pub fn Iterator(comptime Type: type) type {
             return value;
         }
 
-        fn readField(self: *Self, comptime FieldType: type, i: usize, options: anytype) !FieldType {
+        fn readField(self: *Self, comptime FieldType: type, options: anytype, i: usize) !FieldType {
+            if (!comptime std.meta.trait.is(.Struct)(@TypeOf(options))) {
+                @compileError("options passed to readField must be a struct");
+            }
+
             const field_type_info = @typeInfo(FieldType);
 
             return switch (FieldType) {
-                Blob => try self.readBytes(Blob, options.allocator, i, .Blob),
-                Text => try self.readBytes(Text, options.allocator, i, .Text),
+                Blob => blk: {
+                    if (!comptime std.meta.trait.hasField("allocator")(@TypeOf(options))) {
+                        @compileError("options passed to readPointer must have an allocator field when reading a Blob");
+                    }
+                    break :blk try self.readBytes(Blob, options.allocator, i, .Blob);
+                },
+                Text => blk: {
+                    if (!comptime std.meta.trait.hasField("allocator")(@TypeOf(options))) {
+                        @compileError("options passed to readField must have an allocator field when reading a Text");
+                    }
+                    break :blk try self.readBytes(Text, options.allocator, i, .Text);
+                },
                 else => switch (field_type_info) {
                     .Int => try self.readInt(FieldType, i),
                     .Float => try self.readFloat(FieldType, i),
                     .Bool => try self.readBool(i),
                     .Void => {},
                     .Array => try self.readArray(FieldType, i),
-                    .Pointer => try self.readPointer(FieldType, options.allocator, i),
+                    .Pointer => try self.readPointer(FieldType, options, i),
                     .Optional => try self.readOptional(FieldType, options, i),
                     .Enum => |TI| {
-                        const innervalue = try self.readField(FieldType.BaseType, i, options);
+                        const innervalue = try self.readField(FieldType.BaseType, options, i);
 
                         if (comptime std.meta.trait.isZigString(FieldType.BaseType)) {
                             return std.meta.stringToEnum(FieldType, innervalue) orelse unreachable;
@@ -995,7 +1051,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
                 );
                 if (result != c.SQLITE_OK) {
                     diags.err = getLastDetailedErrorFromDb(db.db);
-                    return errorFromResultCode(result);
+                    return errors.errorFromResultCode(result);
                 }
                 break :blk tmp.?;
             };
@@ -1154,7 +1210,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
                 c.SQLITE_DONE => {},
                 else => {
                     diags.err = getLastDetailedErrorFromDb(self.db);
-                    return errorFromResultCode(result);
+                    return errors.errorFromResultCode(result);
                 },
             }
         }
@@ -1212,11 +1268,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         /// in the input query string.
         ///
         /// This cannot allocate memory. If you need to read TEXT or BLOB columns you need to use arrays or alternatively call `oneAlloc`.
-        pub fn one(self: *Self, comptime Type: type, options: anytype, values: anytype) !?Type {
-            if (!comptime std.meta.trait.is(.Struct)(@TypeOf(options))) {
-                @compileError("options passed to iterator must be a struct");
-            }
-
+        pub fn one(self: *Self, comptime Type: type, options: QueryOptions, values: anytype) !?Type {
             var iter = try self.iterator(Type, values);
 
             const row = (try iter.next(options)) orelse return null;
@@ -1224,11 +1276,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         }
 
         /// oneAlloc is like `one` but can allocate memory.
-        pub fn oneAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: anytype, values: anytype) !?Type {
-            if (!comptime std.meta.trait.is(.Struct)(@TypeOf(options))) {
-                @compileError("options passed to iterator must be a struct");
-            }
-
+        pub fn oneAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) !?Type {
             var iter = try self.iterator(Type, values);
 
             const row = (try iter.nextAlloc(allocator, options)) orelse return null;
@@ -1261,10 +1309,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         /// in the input query string.
         ///
         /// Note that this allocates all rows into a single slice: if you read a lot of data this can use a lot of memory.
-        pub fn all(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: anytype, values: anytype) ![]Type {
-            if (!comptime std.meta.trait.is(.Struct)(@TypeOf(options))) {
-                @compileError("options passed to iterator must be a struct");
-            }
+        pub fn all(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) ![]Type {
             var iter = try self.iterator(Type, values);
 
             var rows = std.ArrayList(Type).init(allocator);
@@ -1652,6 +1697,75 @@ test "sqlite: read a single integer value" {
 
         try testing.expectEqual(@as(typ, 33), age.?);
     }
+}
+
+test "sqlite: read a single value into an enum backed by an integer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var db = try getTestDb();
+    try createTestTables(&db);
+
+    try db.exec("INSERT INTO user(id, age) VALUES(?{usize}, ?{usize})", .{}, .{
+        .id = @as(usize, 10),
+        .age = @as(usize, 0),
+    });
+
+    const query = "SELECT age FROM user WHERE id = ?{usize}";
+
+    const IntColor = enum {
+        violet,
+
+        pub const BaseType = u1;
+    };
+
+    // Use one
+    {
+        var stmt: Statement(.{}, ParsedQuery.from(query)) = try db.prepare(query);
+        defer stmt.deinit();
+
+        const b = try stmt.one(IntColor, .{}, .{
+            .id = @as(usize, 10),
+        });
+        try testing.expect(b != null);
+        try testing.expectEqual(IntColor.violet, b.?);
+    }
+
+    // Use oneAlloc
+    {
+        var stmt: Statement(.{}, ParsedQuery.from(query)) = try db.prepare(query);
+        defer stmt.deinit();
+
+        const b = try stmt.oneAlloc(IntColor, &arena.allocator, .{}, .{
+            .id = @as(usize, 10),
+        });
+        try testing.expect(b != null);
+        try testing.expectEqual(IntColor.violet, b.?);
+    }
+}
+
+test "sqlite: read a single value into an enum backed by a string" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var db = try getTestDb();
+    try createTestTables(&db);
+
+    try db.exec("INSERT INTO user(id, favorite_color) VALUES(?{usize}, ?{[]const u8})", .{}, .{
+        .id = @as(usize, 10),
+        .age = @as([]const u8, "violet"),
+    });
+
+    const query = "SELECT favorite_color FROM user WHERE id = ?{usize}";
+
+    var stmt: Statement(.{}, ParsedQuery.from(query)) = try db.prepare(query);
+    defer stmt.deinit();
+
+    const b = try stmt.oneAlloc(TestUser.Color, &arena.allocator, .{}, .{
+        .id = @as(usize, 10),
+    });
+    try testing.expect(b != null);
+    try testing.expectEqual(TestUser.Color.violet, b.?);
 }
 
 test "sqlite: read a single value into void" {
