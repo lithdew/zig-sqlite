@@ -13,7 +13,7 @@ pub const ParsedQuery = @import("query.zig").ParsedQuery;
 
 const Text = @import("query.zig").Text;
 
-const errors = @import("errors.zig");
+pub const errors = @import("errors.zig");
 const Error = errors.Error;
 
 const logger = std.log.scoped(.sqlite);
@@ -269,7 +269,7 @@ fn getDetailedErrorFromResultCode(code: c_int) DetailedError {
         .code = @intCast(usize, code),
         .message = blk: {
             const msg = c.sqlite3_errstr(code);
-            break :blk mem.spanZ(msg);
+            break :blk mem.span(msg);
         },
     };
 }
@@ -279,7 +279,7 @@ fn getLastDetailedErrorFromDb(db: *c.sqlite3) DetailedError {
         .code = @intCast(usize, c.sqlite3_extended_errcode(db)),
         .message = blk: {
             const msg = c.sqlite3_errmsg(db);
-            break :blk mem.spanZ(msg);
+            break :blk mem.span(msg);
         },
     };
 }
@@ -411,7 +411,7 @@ pub const Db = struct {
     ///
     ///     const journal_mode = try db.pragma([]const u8, allocator, .{}, "journal_mode", null);
     ///
-    pub fn pragmaAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
+    pub fn pragmaAlloc(self: *Self, comptime Type: type, allocator: mem.Allocator, options: QueryOptions, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
         comptime var buf: [1024]u8 = undefined;
         comptime var query = getPragmaQuery(&buf, name, arg);
 
@@ -459,7 +459,7 @@ pub const Db = struct {
     }
 
     /// oneAlloc is like `one` but can allocate memory.
-    pub fn oneAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, comptime query: []const u8, options: QueryOptions, values: anytype) !?Type {
+    pub fn oneAlloc(self: *Self, comptime Type: type, allocator: mem.Allocator, comptime query: []const u8, options: QueryOptions, values: anytype) !?Type {
         var stmt = try self.prepareWithDiags(query, options);
         defer stmt.deinit();
         return try stmt.oneAlloc(Type, allocator, options, values);
@@ -631,7 +631,7 @@ pub fn Iterator(comptime Type: type) type {
         }
 
         // nextAlloc is like `next` but can allocate memory.
-        pub fn nextAlloc(self: *Self, allocator: *mem.Allocator, options: QueryOptions) !?Type {
+        pub fn nextAlloc(self: *Self, allocator: mem.Allocator, options: QueryOptions) !?Type {
             var dummy_diags = Diagnostics{};
             var diags = options.diags orelse &dummy_diags;
 
@@ -781,7 +781,7 @@ pub fn Iterator(comptime Type: type) type {
         };
 
         // dupeWithSentinel is like dupe/dupeZ but allows for any sentinel value.
-        fn dupeWithSentinel(comptime SliceType: type, allocator: *mem.Allocator, data: []const u8) !SliceType {
+        fn dupeWithSentinel(comptime SliceType: type, allocator: mem.Allocator, data: []const u8) !SliceType {
             switch (@typeInfo(SliceType)) {
                 .Pointer => |ptr_info| {
                     if (ptr_info.sentinel) |sentinel| {
@@ -808,7 +808,7 @@ pub fn Iterator(comptime Type: type) type {
         // When using .Text you can only read into either []const u8, []u8 or Text.
         //
         // The options must contain an `allocator` field which will be used to create a copy of the data.
-        fn readBytes(self: *Self, comptime BytesType: type, allocator: *mem.Allocator, _i: usize, comptime mode: ReadBytesMode) !BytesType {
+        fn readBytes(self: *Self, comptime BytesType: type, allocator: mem.Allocator, _i: usize, comptime mode: ReadBytesMode) !BytesType {
             const i = @intCast(c_int, _i);
 
             switch (mode) {
@@ -1276,7 +1276,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         }
 
         /// oneAlloc is like `one` but can allocate memory.
-        pub fn oneAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) !?Type {
+        pub fn oneAlloc(self: *Self, comptime Type: type, allocator: mem.Allocator, options: QueryOptions, values: anytype) !?Type {
             var iter = try self.iterator(Type, values);
 
             const row = (try iter.nextAlloc(allocator, options)) orelse return null;
@@ -1309,7 +1309,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         /// in the input query string.
         ///
         /// Note that this allocates all rows into a single slice: if you read a lot of data this can use a lot of memory.
-        pub fn all(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) ![]Type {
+        pub fn all(self: *Self, comptime Type: type, allocator: mem.Allocator, options: QueryOptions, values: anytype) ![]Type {
             var iter = try self.iterator(Type, values);
 
             var rows = std.ArrayList(Type).init(allocator);
@@ -2196,7 +2196,7 @@ fn getTestDb() !Db {
     });
 }
 
-fn tmpDbPath(allocator: *mem.Allocator) ![:0]const u8 {
+fn tmpDbPath(allocator: mem.Allocator) ![:0]const u8 {
     const tmp_dir = testing.tmpDir(.{});
 
     const path = try std.fs.path.join(allocator, &[_][]const u8{
@@ -2210,7 +2210,7 @@ fn tmpDbPath(allocator: *mem.Allocator) ![:0]const u8 {
     return allocator.dupeZ(u8, path);
 }
 
-fn dbMode(allocator: *mem.Allocator) Db.Mode {
+fn dbMode(allocator: mem.Allocator) Db.Mode {
     return if (build_options.in_memory) blk: {
         break :blk .{ .Memory = {} };
     } else blk: {
